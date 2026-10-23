@@ -1,0 +1,73 @@
+# Control plane stack. Providers run workers separately with docker-compose.worker.yml.
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: agentmesh
+      POSTGRES_USER: agentmesh
+      POSTGRES_PASSWORD: agentmesh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentmesh -d agentmesh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://agentmesh:agentmesh@postgres:5432/agentmesh
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY to a random value of at least 32 characters}
+      - ENVIRONMENT=production
+      - ALLOW_TEST_CREDITS=false
+      # https URL customers and workers use to reach this API (behind your TLS-terminating proxy)
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:?Set PUBLIC_BASE_URL to the public https URL of the API}
+      - FRONTEND_URL=${FRONTEND_URL:?Set FRONTEND_URL to the public URL of the dashboard}
+      - CORS_ORIGINS=["${FRONTEND_URL}"]
+      # Paystack test key (sk_test_...). Payments stay disabled while unset.
+      - PAYSTACK_SECRET_KEY=${PAYSTACK_SECRET_KEY:-}
+      - BILLING_CURRENCY=${BILLING_CURRENCY:-NGN}
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
+    # --proxy-headers: client addresses (rate limits, audit log, webhook IP checks) come from the TLS proxy.
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

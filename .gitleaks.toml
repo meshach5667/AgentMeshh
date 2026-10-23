@@ -1,0 +1,12 @@
+# Gitleaks config for the Security Scan workflow. Keeps every default rule and allowlists only the
+# placeholder keys used by tests and the e2e README; anything else that looks like a key still fails the scan.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake Paystack/Stripe-style keys in tests and docs"
+regexes = [
+  '''^sk_test_fake0+$''',
+  '''^sk_test_abc123abc123$''',
+  '''^sk_live_1234567890abcdef$''',
+]
