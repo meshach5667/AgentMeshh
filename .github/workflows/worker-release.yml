@@ -1,0 +1,62 @@
+name: Worker release
+
+on:
+  push:
+    tags:
+      - "worker-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches WORKER_VERSION
+        id: version
+        run: |
+          VERSION=$(python -c "import re,pathlib; print(re.search(r'WORKER_VERSION = \"([^\"]+)\"', pathlib.Path('server/node_agent/config.py').read_text()).group(1))")
+          TAG_VERSION="${GITHUB_REF_NAME#worker-v}"
+          if [ "$VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match WORKER_VERSION $VERSION in server/node_agent/config.py"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build release assets
+        run: |
+          mkdir -p release
+          python server/scripts/build_worker_wheel.py release
+          cp server/packaging/install.sh server/packaging/uninstall.sh release/
+          chmod +x release/install.sh release/uninstall.sh
+          bash -n release/install.sh
+          bash -n release/uninstall.sh
+          cd release && sha256sum agentmesh_worker-*.whl install.sh uninstall.sh > SHA256SUMS && cat SHA256SUMS
+
+      - name: Check the wheel installs
+        run: |
+          python -m venv /tmp/worker-venv
+          /tmp/worker-venv/bin/pip install --quiet release/agentmesh_worker-${{ steps.version.outputs.version }}-py3-none-any.whl
+          /tmp/worker-venv/bin/agentmesh-worker --help > /dev/null
+          /tmp/worker-venv/bin/agentmesh-worker hardware
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          AgentMesh worker $VERSION for Linux and macOS (Python 3.11+, venv, and Ollama required).
+
+          Install it from the provider dashboard (Add a machine), which fills in the control-plane URL and a
+          one-time enrollment token. Verify downloads with \`SHA256SUMS\` before running \`install.sh\`.
+          See docs/WORKER.md for details.
+          EOF
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "AgentMesh worker $VERSION" --notes-file notes.md --verify-tag

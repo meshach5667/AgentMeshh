@@ -1,0 +1,8 @@
+**/.env
+**/.env.*
+!/.env.example
+/server/
+/docs/
+/.github/
+**/node_modules
+**/.next

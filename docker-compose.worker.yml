@@ -1,0 +1,63 @@
+# AgentMesh Docker worker for providers.
+#
+#   export AGENTMESH_CONTROL_PLANE_URL=https://agentmesh.example.com
+#   export AGENTMESH_ENROLLMENT_TOKEN=am_enroll_...      # one-time token from the provider dashboard
+#   export DOCKER_GID=$(getent group docker | cut -d: -f3)
+#   docker compose -f docker-compose.worker.yml up -d
+#
+# After the first successful start the token is no longer needed (credentials live in the state volume).
+# See docs/WORKER.md for resource limits, GPU notes, upgrades, and uninstalling.
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.node-agent
+    image: agentmesh/worker:local
+    restart: unless-stopped
+    environment:
+      AGENTMESH_CONTROL_PLANE_URL: ${AGENTMESH_CONTROL_PLANE_URL:?Set AGENTMESH_CONTROL_PLANE_URL}
+      AGENTMESH_ENROLLMENT_TOKEN: ${AGENTMESH_ENROLLMENT_TOKEN:-}
+      AGENTMESH_NODE_NAME: ${AGENTMESH_NODE_NAME:-docker-worker}
+      AGENTMESH_ALLOW_INSECURE_CONTROL_PLANE: ${AGENTMESH_ALLOW_INSECURE_CONTROL_PLANE:-false}
+      # Resources offered to AgentMesh. Unset: half the CPU and RAM, at most 20 GB disk, no GPU.
+      AGENTMESH_MAX_CPU_CORES: ${AGENTMESH_MAX_CPU_CORES:-}
+      AGENTMESH_MAX_RAM_MB: ${AGENTMESH_MAX_RAM_MB:-}
+      AGENTMESH_MAX_DISK_MB: ${AGENTMESH_MAX_DISK_MB:-}
+      AGENTMESH_ALLOW_GPU: ${AGENTMESH_ALLOW_GPU:-false}
+      # Pin by digest in production, e.g. ollama/ollama@sha256:<digest>
+      AGENTMESH_OLLAMA_IMAGE: ${AGENTMESH_OLLAMA_IMAGE:-ollama/ollama:0.12.3}
+      AGENTMESH_WORKLOAD_NETWORK: agentmesh-workloads
+      # Workloads join this network only while downloading their model, then lose internet access.
+      AGENTMESH_EGRESS_NETWORK: agentmesh-egress
+      AGENTMESH_MODELS_VOLUME: agentmesh-models
+    volumes:
+      - agentmesh-worker-state:/var/lib/agentmesh
+      # Required to manage workload containers. This grants the worker root-equivalent control of the host
+      # Docker daemon; prefer rootless Docker. Workload containers never get this socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    networks:
+      - agentmesh-workloads
+      - egress
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+networks:
+  agentmesh-workloads:
+    name: agentmesh-workloads
+    internal: true  # no route to the internet for serving workloads
+  agentmesh-egress:
+    name: agentmesh-egress
+  egress: {}
+
+volumes:
+  agentmesh-worker-state:
+  agentmesh-models:
+    name: agentmesh-models

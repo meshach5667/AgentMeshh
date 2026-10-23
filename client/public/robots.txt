@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /customer/
+Disallow: /provider/
+Disallow: /operator/

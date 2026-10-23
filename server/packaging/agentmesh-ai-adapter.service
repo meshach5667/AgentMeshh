@@ -1,0 +1,22 @@
+# systemd user unit for the AgentMesh AI inference adapter (docs: /docs/ai-agent).
+#   cp agentmesh-ai-adapter.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now agentmesh-ai-adapter
+#   loginctl enable-linger "$USER"     # keep it running when you are logged out
+# Configuration: ~/.config/agentmesh/ai-adapter.env (chmod 600; holds AI_INFERENCE_TOKEN).
+[Unit]
+Description=AgentMesh AI inference adapter (Gemma via local Ollama)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AgentMesh/server
+ExecStart=%h/AgentMesh/server/venv/bin/python -m ai_adapter run
+Restart=on-failure
+RestartSec=30
+# The adapter itself is light; keep it below interactive work.
+Nice=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,383 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  server-lint-and-type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt
+          pip install ruff mypy
+          
+      - name: Run Ruff check
+        run: ruff check server/
+        
+      - name: Run Ruff format check
+        run: ruff format --check server/
+        
+      - name: Run mypy
+        run: mypy server/app/ --ignore-missing-imports
+
+  server-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agentmesh
+          POSTGRES_USER: agentmesh
+          POSTGRES_PASSWORD: agentmesh
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+          
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh
+        run: cd server && alembic upgrade head
+        
+      - name: Run pytest
+        env:
+          DATABASE_URL: postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh
+          TEST_DATABASE_URL: postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh_test
+          REDIS_URL: redis://localhost:6379/0
+          SECRET_KEY: test-secret-key
+          ENVIRONMENT: test
+        run: |
+          PGPASSWORD=agentmesh psql -h localhost -U agentmesh -d agentmesh -c 'CREATE DATABASE agentmesh_test'
+          cd server && pytest tests/ -v --cov=app --cov-report=xml --cov-fail-under=60
+        
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: server/coverage.xml
+
+  client-lint-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          
+      - name: Install dependencies
+        run: cd client && npm ci
+        
+      - name: Run lint
+        run: cd client && npm run lint
+        
+      - name: Run build
+        run: cd client && npm run build
+        
+      - name: Type check
+        run: cd client && npx tsc --noEmit
+
+  client-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          
+      - name: Install dependencies
+        run: cd client && npm ci
+        
+      - name: Run tests
+        run: cd client && npm test --if-present
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build server image
+        run: docker build -t agentmesh-server -f Dockerfile.server .
+        
+      - name: Build worker image
+        run: docker build -t agentmesh-worker -f Dockerfile.node-agent .
+
+      - name: Worker image smoke test
+        run: docker run --rm --entrypoint python agentmesh-worker -m node_agent hardware
+        
+      - name: Build client image
+        run: docker build -t agentmesh-client -f Dockerfile.client .
+
+  migrations-check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agentmesh
+          POSTGRES_USER: agentmesh
+          POSTGRES_PASSWORD: agentmesh
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          
+      - name: Install dependencies
+        run: |
+          pip install -r server/requirements.txt
+          
+      - name: Check migrations reversibility
+        env:
+          DATABASE_URL: postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh
+        run: |
+          cd server
+          alembic upgrade head
+          alembic check
+          alembic downgrade -1
+          alembic upgrade head
+
+      - name: Backup and restore round trip
+        env:
+          DATABASE_URL: postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh
+        run: |
+          cd server
+          # Dumps travel over stdin/stdout, so the container needs no volume; a bind mount would create the
+          # backup directory as root and the runner user could not write the dump into it.
+          mkdir -p /tmp/agentmesh-backups
+          PG="docker run --rm -i --network host postgres:16-alpine"
+          LIBPQ=postgresql://agentmesh:agentmesh@localhost:5432
+          $PG psql "$LIBPQ/agentmesh" -c "insert into pricing_rules (id, version, currency, cpu_core_hour, ram_gb_hour, vram_gb_hour, input_tokens_per_million, output_tokens_per_million, platform_fee_rate, effective_from, created_at) values (gen_random_uuid(), 99, 'NGN', 1, 2, 3, 4, 5, 0.1, now(), now())"
+          PG_DUMP="$PG pg_dump" ops/backup_db.sh /tmp/agentmesh-backups
+          $PG psql "$LIBPQ/agentmesh" -c "create database agentmesh_restore"
+          DATABASE_URL=postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh_restore \
+            PG_RESTORE="$PG pg_restore" PSQL="$PG psql" ops/restore_db.sh /tmp/agentmesh-backups/agentmesh-*.dump
+          test "$($PG psql "$LIBPQ/agentmesh_restore" -tAc 'select version from pricing_rules')" = "99"
+          DATABASE_URL=postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh_restore alembic check
+
+  e2e-stub-runtime:
+    # Full worker -> control plane -> gateway flow on PostgreSQL with real migrations. The model runtime is a
+    # labelled stub (server/tests/fixtures/fake_ollama.py), so this proves the platform path, not inference.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agentmesh
+          POSTGRES_USER: agentmesh
+          POSTGRES_PASSWORD: agentmesh
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh
+      ENVIRONMENT: test
+      PUBLIC_BASE_URL: http://127.0.0.1:8000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt
+      - name: Migrate
+        run: cd server && alembic upgrade head
+      - name: Start control plane
+        run: cd server && (uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../cp.log 2>&1 &) && sleep 5 && curl -sf http://127.0.0.1:8000/health
+      - name: End-to-end (stub runtime)
+        run: |
+          cd server
+          python scripts/e2e_ollama.py --api http://127.0.0.1:8000 --mode agent --model smollm2:135m \
+            --ollama-binary tests/fixtures/fake_ollama.py
+      - name: Control plane log
+        if: always()
+        run: cat cp.log
+
+  e2e-multi-replica:
+    # Two API replicas sharing PostgreSQL and Redis. The worker connects to replica A; every customer call,
+    # including streaming inference, goes to replica B, so requests must cross replicas through Redis.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agentmesh
+          POSTGRES_USER: agentmesh
+          POSTGRES_PASSWORD: agentmesh
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    env:
+      DATABASE_URL: postgresql+asyncpg://agentmesh:agentmesh@localhost:5432/agentmesh
+      REDIS_URL: redis://localhost:6379/0
+      COORDINATION_BACKEND: redis
+      ENVIRONMENT: test
+      PUBLIC_BASE_URL: http://127.0.0.1:8001
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt
+      - name: Migrate
+        run: cd server && alembic upgrade head
+      - name: Start two replicas
+        run: |
+          cd server
+          (uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../replica-a.log 2>&1 &)
+          (uvicorn app.main:app --host 127.0.0.1 --port 8001 > ../replica-b.log 2>&1 &)
+          sleep 6 && curl -sf http://127.0.0.1:8000/health && curl -sf http://127.0.0.1:8001/health
+      - name: End-to-end across replicas (stub runtime)
+        run: |
+          cd server
+          python scripts/e2e_ollama.py --api http://127.0.0.1:8000 --customer-api http://127.0.0.1:8001 \
+            --mode agent --model smollm2:135m --ollama-binary tests/fixtures/fake_ollama.py
+      - name: Replica logs
+        if: always()
+        run: cat replica-a.log replica-b.log
+
+  installer:
+    # Build the worker wheel, install it with packaging/install.sh (no service: CI has no systemd user
+    # session), enroll, run the installed agentmesh-worker, deploy on it (stub runtime), then uninstall.
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: sqlite+aiosqlite:///./ci.db
+      ENVIRONMENT: test
+      PUBLIC_BASE_URL: http://127.0.0.1:8000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt
+      - name: Build wheel
+        run: cd server && python scripts/build_worker_wheel.py dist
+      - name: Start control plane
+        run: |
+          cd server && python scripts/init_dev_db.py
+          (uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../cp.log 2>&1 &) && sleep 5
+      - name: Install, run, deploy, uninstall
+        run: |
+          cd server
+          TOKEN=$(python - <<'PY'
+          import httpx
+          r = httpx.post("http://127.0.0.1:8000/api/v1/auth/register",
+                         json={"email": "ci-provider@example.com", "password": "ci-password-1", "role": "provider"})
+          h = {"Authorization": "Bearer " + r.json()["access_token"]}
+          print(httpx.post("http://127.0.0.1:8000/api/v1/nodes/enrollment-tokens", json={}, headers=h).json()["token"])
+          PY
+          )
+          ./packaging/install.sh --control-plane http://127.0.0.1:8000 --token "$TOKEN" --wheel dist/agentmesh_worker-*.whl \
+            --ollama "$PWD/tests/fixtures/fake_ollama.py" --max-ram-mb 2048 --max-disk-mb 2048 --no-service --yes
+          export AGENTMESH_CONFIG_FILE=$HOME/.config/agentmesh/agentmesh-worker.env
+          W=$HOME/.local/share/agentmesh/venv-agentmesh-worker/bin/agentmesh-worker
+          $W doctor || true
+          ($W run > ../worker.log 2>&1 &)
+          timeout 60 bash -c "until $W status | grep -q '\"connected\": true'; do sleep 2; done"
+          python - <<'PY'
+          import httpx, time
+          api = "http://127.0.0.1:8000/api/v1"
+          r = httpx.post(f"{api}/auth/register", json={"email": "ci-c@example.com", "password": "ci-password-1", "role": "customer"})
+          h = {"Authorization": "Bearer " + r.json()["access_token"]}
+          m = next(m for m in httpx.get(f"{api}/models").json() if m["model_tag"] == "smollm2:135m")
+          d = httpx.post(f"{api}/deployments", json={"model_id": m["id"]}, headers=h).json()
+          for _ in range(60):
+              d = httpx.get(f"{api}/deployments/{d['id']}", headers=h).json()
+              if d["status"] in ("READY", "FAILED"):
+                  break
+              time.sleep(2)
+          assert d["status"] == "READY", d
+          out = httpx.post(f"{d['endpoint']}/api/generate", json={"prompt": "hi", "stream": False}, headers=h, timeout=60)
+          assert out.status_code == 200 and "stub runtime" in out.json()["response"], out.text
+          print("installed worker served a deployment")
+          PY
+          $W drain && sleep 8
+          pkill -TERM -f "agentmesh-worker run" && sleep 5   # no service in CI: stop the foreground worker
+          ./packaging/uninstall.sh --purge-models --yes
+          test ! -e $HOME/.config/agentmesh && test ! -e $HOME/.local/share/agentmesh
+      - name: Logs
+        if: always()
+        run: cat cp.log worker.log || true
+
+  e2e-real-ollama:
+    # Real model download and inference on CPU. Manual trigger only: downloads Ollama and a ~270 MB model.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: sqlite+aiosqlite:///./e2e.db
+      ENVIRONMENT: test
+      PUBLIC_BASE_URL: http://127.0.0.1:8000
+      OLLAMA_VERSION: "0.12.3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt
+      - name: Install pinned Ollama
+        run: curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=$OLLAMA_VERSION sh && sudo systemctl stop ollama || true
+      - name: Start control plane
+        run: |
+          cd server && python scripts/init_dev_db.py
+          (uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../cp.log 2>&1 &) && sleep 5
+      - name: End-to-end (real Ollama)
+        run: cd server && python scripts/e2e_ollama.py --api http://127.0.0.1:8000 --mode agent --model smollm2:135m
+      - name: Logs
+        if: always()
+        run: cat cp.log; cat /tmp/agentmesh-e2e-worker-*/worker.log || true
